@@ -13,7 +13,7 @@ import argparse
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from config import get_model_config, TrainConfig, ModelConfig
 from model import WikiLM
@@ -117,7 +117,7 @@ def train(model_config_name: str = "small", train_config: TrainConfig = None):
 
     # ── Load and tokenize data ───────────────────────────────────────────────
     articles = load_wikipedia_articles(train_config.num_articles)
-    token_ids = tokenize_corpus(articles, tokenizer)
+    token_ids = tokenize_corpus(articles, tokenizer, tokenizer_path=train_config.tokenizer_path)
 
     train_loader, val_loader = create_dataloaders(
         token_ids,
@@ -151,7 +151,8 @@ def train(model_config_name: str = "small", train_config: TrainConfig = None):
         betas=(train_config.beta1, train_config.beta2),
     )
 
-    scaler = GradScaler(enabled=(train_config.mixed_precision and device.type == "cuda"))
+    use_amp = train_config.mixed_precision and device.type == "cuda"
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     # ── Training loop ────────────────────────────────────────────────────────
     total_steps = train_config.epochs * len(train_loader)
@@ -175,7 +176,7 @@ def train(model_config_name: str = "small", train_config: TrainConfig = None):
                 param_group["lr"] = lr
 
             # forward pass with optional mixed precision
-            with autocast(device_type=device.type, enabled=train_config.mixed_precision and device.type == "cuda"):
+            with autocast(device.type, enabled=use_amp):
                 _, loss = model(x, y)
 
             # backward pass

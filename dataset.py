@@ -5,10 +5,29 @@ Wikipedia data loading, preprocessing, and PyTorch Dataset/DataLoader creation.
 """
 
 import re
+import os
+import multiprocessing as mp
+from functools import partial
+
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 
 from tokenizer import BPETokenizer
+
+
+# ── Global tokenizer for worker processes ────────────────────────────────────
+_WORKER_TOKENIZER: BPETokenizer = None
+
+
+def _init_worker(tokenizer_path: str):
+    """Initialize a tokenizer in each worker process."""
+    global _WORKER_TOKENIZER
+    _WORKER_TOKENIZER = BPETokenizer.load(tokenizer_path)
+
+
+def _encode_article(article: str) -> list[int]:
+    """Encode a single article (called in worker process)."""
+    return _WORKER_TOKENIZER.encode(article, add_special_tokens=True)
 
 
 class WikiTextDataset(Dataset):
@@ -74,7 +93,7 @@ def load_wikipedia_articles(num_articles: int = 50000, min_length: int = 300) ->
     from datasets import load_dataset
 
     print(f"Loading {num_articles} Wikipedia articles...")
-    dataset = load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
+    dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
 
     articles = []
     seen = 0
@@ -94,19 +113,52 @@ def load_wikipedia_articles(num_articles: int = 50000, min_length: int = 300) ->
     return articles
 
 
-def tokenize_corpus(articles: list[str], tokenizer: BPETokenizer) -> list[int]:
+def tokenize_corpus(
+    articles: list[str],
+    tokenizer: BPETokenizer,
+    tokenizer_path: str = "tokenizer.json",
+    num_workers: int = None,
+) -> list[int]:
     """
     Tokenize an entire corpus into a flat list of token IDs.
+    Uses multiprocessing to parallelize across CPU cores.
 
     Each article is bounded by BOS/EOS tokens.
+
+    Args:
+        articles: List of article strings
+        tokenizer: BPE tokenizer (used as fallback for single-process mode)
+        tokenizer_path: Path to saved tokenizer file (needed for multiprocessing)
+        num_workers: Number of worker processes (defaults to CPU count)
     """
-    print("Tokenizing corpus...")
+    if num_workers is None:
+        num_workers = min(mp.cpu_count(), 16)
+
+    # Fall back to single-process if tokenizer file doesn't exist or only 1 core
+    if num_workers <= 1 or not os.path.exists(tokenizer_path):
+        print("Tokenizing corpus (single-process)...")
+        all_ids = []
+        for i, article in enumerate(articles):
+            ids = tokenizer.encode(article, add_special_tokens=True)
+            all_ids.extend(ids)
+            if (i + 1) % 10000 == 0:
+                print(f"  Tokenized {i + 1}/{len(articles)} articles ({len(all_ids):,} tokens)")
+        print(f"Total tokens: {len(all_ids):,}")
+        return all_ids
+
+    print(f"Tokenizing corpus ({num_workers} workers)...")
+
+    # Process articles in parallel, preserving order
+    chunk_size = max(1, len(articles) // (num_workers * 4))
     all_ids = []
-    for i, article in enumerate(articles):
-        ids = tokenizer.encode(article, add_special_tokens=True)
-        all_ids.extend(ids)
-        if (i + 1) % 10000 == 0:
-            print(f"  Tokenized {i + 1}/{len(articles)} articles ({len(all_ids):,} tokens)")
+    done = 0
+
+    with mp.Pool(num_workers, initializer=_init_worker, initargs=(tokenizer_path,)) as pool:
+        for ids in pool.imap(_encode_article, articles, chunksize=chunk_size):
+            all_ids.extend(ids)
+            done += 1
+            if done % 10000 == 0:
+                print(f"  Tokenized {done}/{len(articles)} articles ({len(all_ids):,} tokens)")
 
     print(f"Total tokens: {len(all_ids):,}")
     return all_ids
